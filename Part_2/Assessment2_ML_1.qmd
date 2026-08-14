@@ -1,0 +1,970 @@
+---
+title: "LIFE748 - ML and data analysis"
+author: "Francesco Del Carratore"
+format: html
+editor: visual
+---
+
+## Introduction
+
+In this tutorial, we will analyze a simulated RNA-seq dataset. Our goal is to identify Differentially Expressed Genes (DEGs) between two conditions (Condition A and Condition B), visualize the results, and use both unsupervised and supervised machine learning techniques to classify the samples based on their gene expression profiles.
+
+## Step 0: Load the required libraries
+
+```{r warning=FALSE, message=FALSE }
+library(DESeq2) # Bioconductor
+library(ggplot2) # CRAN
+library(EnhancedVolcano) # Bioconductor
+library(pheatmap) # Bioconductor
+library(caret) # CRAN
+library(MASS) # CRAN
+library(e1071) # CRAN
+library(reshape2)
+
+```
+
+If these packages are not already available, you will need to install them either from CRAN (install.packages('package_name')), or from Bioconductor (BiocManager::install('package_name')
+
+## Step 1: Load the Count Matrix
+
+First, we load the raw count matrix and set up the sample metadata (phenotype data). We assume the first 25 columns belong to Condition A, and the next 25 belong to Condition B.
+
+```{r}
+counts <- read.csv("dataset_LIFE748_1.csv", row.names = 1)
+
+colData <- data.frame(
+  row.names = colnames(counts),
+  Condition = c(rep('CondA',25),rep('CondB',25))
+)
+
+```
+
+## Step 2: Normalize and Identify DEGs with DESeq2
+
+We will use `DESeq2` to normalize the library sizes and perform statistical testing to identify which genes are differentially expressed between Condition B and Condition A.
+
+```{r}
+# 1. Create the DESeq2 dataset object
+dds <- DESeqDataSetFromMatrix(countData = counts,
+                              colData = colData,
+                              design = ~ Condition)
+
+# 2. Run the DESeq2 pipeline
+dds <- DESeq(dds)
+
+# 3. Extract the results (Condition B vs Condition A)
+res <- results(dds)
+
+# 4. Convert this object into a dataframe for easier visualisation (optional)
+
+res <- as.data.frame(res)
+
+# 5. Extract normalized counts for downstream machine learning
+vsd <- vst(dds, blind = FALSE) # Variance stabilizing transformation
+normalized_counts <- assay(vsd)
+
+```
+
+## Step 3: Report DEGs (Table and Volcano Plot)
+
+We define statistically significant DEGs as those with an adjusted p-value (FDR) \< 0.05 and an absolute log2 Fold Change \> 1.
+
+```{r}
+## Add gene identifiers as a column
+res$gene <- rownames(res)
+
+## Remove genes for which DESeq2 could not calculate an adjusted p-value
+res_complete <- res[!is.na(res$padj), ]
+
+## Identify significant differentially expressed genes
+## Threshold: adjusted p-value < 0.05 and absolute log2 fold change > 1
+DEGs <- subset(
+  res_complete,
+  padj < 0.05 & abs(log2FoldChange) > 1
+)
+
+## Classify direction of differential expression
+DEGs$regulation <- ifelse(
+  DEGs$log2FoldChange > 1,
+  "Upregulated",
+  "Downregulated"
+)
+
+## Number of significant DEGs
+nrow(DEGs)
+
+## Numbers up- and down-regulated
+table(DEGs$regulation)
+
+## Sort by adjusted p-value
+DEGs <- DEGs[order(DEGs$padj), ]
+
+# Display the top 20 DEGs
+head(DEGs, 20)
+
+
+## Export for downstream# structural bioinformatics analysis in Part 3
+write.csv(
+  DEGs,
+  "DEG_candidates.csv",
+  row.names = FALSE
+)
+```
+
+Generate a volcano plot to visualise the results
+
+```{r}
+#| fig-width: 11
+#| fig-height: 7
+#| out-width: "100%"
+
+EnhancedVolcano(
+  res,
+  lab = rownames(res),
+  x = "log2FoldChange",
+  y = "padj",
+  pCutoff = 0.05,
+  FCcutoff = 1,
+
+  title = "Differential expression: CondB vs CondA",
+  subtitle = "FDR < 0.05 and |log2FC| > 1",
+
+  xlab = expression(Log[2] ~ "fold change"),
+  ylab = expression(-Log[10] ~ "adjusted p-value"),
+
+  selectLab = rownames(DEGs)[1:10],
+
+  labSize = 3.5,
+  pointSize = 2,
+
+  titleLabSize = 22,
+  subtitleLabSize = 12,
+
+  legendLabels = c(
+    "NS",
+    expression(Log[2]~FC),
+    "FDR",
+    expression(FDR~and~Log[2]~FC)
+  ),
+
+  legendPosition = "right",
+  legendLabSize = 10,
+  legendIconSize = 3,
+
+  drawConnectors = TRUE,
+  widthConnectors = 0.5
+)
+```
+
+## Step 4: Isolate Differentially Expressed Genes
+
+To reduce noise and dimensionality for our machine learning algorithms, we will subset our normalized count matrix to only include the statistically significant DEGs identified above.
+
+In order to make sure we don't lose too much information, let's relax a bit the thresholds for significance
+
+```{r}
+## Relax significance thresholds for machine-learning feature selection while retaining a minimum effect size requirement
+ML_DEGs <- subset(
+  res_complete,
+  padj < 0.10 & abs(log2FoldChange) > 0.5
+)
+
+## Number of genes retained for ML
+nrow(ML_DEGs)
+
+## Extract selected genes 
+ML_expression <- normalized_counts[
+  rownames(normalized_counts) %in% rownames(ML_DEGs),
+]
+
+## Check
+dim(ML_expression)
+
+## Transpose
+ML_data <- as.data.frame(t(ML_expression))
+
+## Add experimental condition
+ML_data$Condition <- colData$Condition
+
+## Check
+dim(ML_data)
+table(ML_data$Condition)
+```
+
+## Step 5: Unsupervised Clustering
+
+We will use unsupervised clustering to investigate whether samples group according to their gene-expression profiles without providing the algorithms with the known experimental condition labels.
+
+### Step 5.1: k-means
+
+```{r}
+## Expression features only
+X <- ML_data[, !names(ML_data) %in% "Condition"]
+
+## Check dimensions of the clustering dataset
+dim(X)
+
+## Check for missing values
+sum(is.na(X))
+
+
+
+## Elbow test to explore the appropriate number of clusters
+
+set.seed(748)
+
+k.max <- 10
+
+wss <- sapply(
+  1:k.max,
+  function(k) {
+    kmeans(
+      X,
+      centers = k,
+      nstart = 5,
+      iter.max = 15
+    )$tot.withinss
+  }
+)
+
+plot(
+  1:k.max,
+  wss,
+  type = "b",
+  pch = 19,
+  frame = FALSE,
+  xlab = "Number of clusters (k)",
+  ylab = "Total within-cluster sum of squares",
+  main = "Elbow plot for k-means clustering"
+)
+
+
+## Perform k-means clustering using two clusters
+
+set.seed(748)
+
+kmeans_fit <- kmeans(
+  X,
+  centers = 2,
+  iter.max = 15,
+  nstart = 5
+)
+
+## Examine the result
+kmeans_fit
+```
+
+### Step 5.2: Hierarchical Clustering
+
+```{r}
+## Calculate pairwise Euclidean distances between samples
+
+dist_mat <- dist(
+  X,
+  method = "euclidean"
+)
+
+## Inspect part of the distance matrix
+as.matrix(dist_mat)[1:5, 1:5]
+
+
+
+## Perform hierarchical clustering using average linkage
+
+hc <- hclust(
+  dist_mat,
+  method = "average"
+)
+
+## Plot dendrogram
+plot(
+  hc,
+  labels = ML_data$Condition,
+  main = "Hierarchical clustering of gene-expression profiles",
+  xlab = "",
+  sub = ""
+)
+
+
+## Cut the dendrogram into two clusters
+
+hc_clusters <- cutree(
+  hc,
+  k = 2
+)
+
+## Compare hierarchical clusters with experimental conditions
+
+hc_comparison <- table(
+  Cluster = hc_clusters,
+  Condition = ML_data$Condition
+)
+
+hc_comparison
+```
+
+### Step 5.3: Visualisation of Expression Patterns
+
+Visualise the results (HINT: an heatmap would be perfect for this).
+
+```{r}
+#| fig-width: 10
+#| fig-height: 7
+#| out-width: "100%"
+
+## Sample-condition annotation
+annotation_col <- data.frame(
+  Condition = ML_data$Condition
+)
+
+rownames(annotation_col) <- rownames(ML_data)
+
+## Heatmap colour scale
+heatmap_breaks <- seq(
+  -3,
+  3,
+  length.out = 101
+)
+
+pheatmap(
+  ML_expression,
+  scale = "row",
+
+  annotation_col = annotation_col,
+
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+
+  clustering_method = "average",
+
+  border_color = NA,
+
+  breaks = heatmap_breaks,
+
+  main = "Expression profiles of ML-selected genes",
+
+  fontsize = 18
+)
+```
+
+## Step 6: Supervised Learning (LDA)
+
+Next, we train classifiers to predict the condition of a sample based on its DEG expression profile. We will split the data into a training set (70%) and a testing set (30%).
+
+```{r}
+## condition to a factor
+ML_data$Condition <- factor(
+  ML_data$Condition,
+  levels = c("CondA", "CondB")
+)
+
+## Create a reproducible 70/30 training-validation split
+set.seed(748)
+
+train_index <- createDataPartition(
+  ML_data$Condition,
+  p = 0.7,
+  list = FALSE,
+  times = 1
+)
+
+train_data <- ML_data[train_index, ]
+validate_data <- ML_data[-train_index, ]
+
+## Check
+dim(train_data)
+dim(validate_data)
+
+table(train_data$Condition)
+table(validate_data$Condition)
+```
+
+### Step 6.1: Train LDA (Linear Discriminant Analysis)
+
+```{r}
+## Train the LDA classifier
+lda_model <- lda(
+  Condition ~ .,
+  data = train_data
+)
+
+## Examine
+lda_model
+```
+
+### Step 6.2: Predict the Validation Samples
+
+```{r}
+lda_pred <- predict(
+  lda_model,
+  newdata = validate_data,
+  type = "class"
+)
+
+lda_pred$class
+```
+
+### Step 6.3: LDA confusion matrix
+
+```{r}
+lda_cm <- confusionMatrix(
+  data = as.factor(lda_pred$class),
+  reference = as.factor(validate_data$Condition),
+  positive = "CondB"
+)
+
+lda_cm
+
+```
+
+## Step 7: Supervised Learning (SVM)
+
+### Step 7.1: Train the SVM classifier
+
+```{r}
+## Train an SVM classifier using the default radial kernel
+svm_model <- svm(
+  Condition ~ .,
+  data = train_data
+)
+
+# Examine
+svm_model
+
+```
+
+### Step 7.2: Predict the Validation Samples
+
+```{r}
+svm_pred <- predict(
+  svm_model,
+  newdata = validate_data
+)
+
+svm_pred
+```
+
+### Step 7.3: SVM Confusion Matrix
+
+```{r}
+svm_cm <- confusionMatrix(
+  data = as.factor(svm_pred),
+  reference = as.factor(validate_data$Condition),
+  positive = "CondB"
+)
+
+svm_cm
+
+```
+
+### Step 7.4: Compare SVM Kernel Functions
+
+```{r}
+svm_radial <- svm(
+  Condition ~ .,
+  data = train_data,
+  kernel = "radial"
+)
+
+svm_linear <- svm(
+  Condition ~ .,
+  data = train_data,
+  kernel = "linear"
+)
+
+svm_polynomial <- svm(
+  Condition ~ .,
+  data = train_data,
+  kernel = "polynomial"
+)
+
+svm_sigmoid <- svm(
+  Condition ~ .,
+  data = train_data,
+  kernel = "sigmoid"
+)
+
+## Generate predictions for the validation dataset
+pred_radial <- predict(svm_radial, newdata = validate_data)
+pred_linear <- predict(svm_linear, newdata = validate_data)
+pred_polynomial <- predict(svm_polynomial, newdata = validate_data)
+pred_sigmoid <- predict(svm_sigmoid, newdata = validate_data)
+
+```
+
+```{r}
+## Calculate confusion matrices for each SVM kernel
+
+cm_radial <- confusionMatrix(
+  pred_radial,
+  validate_data$Condition,
+  positive = "CondB"
+)
+
+cm_linear <- confusionMatrix(
+  pred_linear,
+  validate_data$Condition,
+  positive = "CondB"
+)
+
+cm_polynomial <- confusionMatrix(
+  pred_polynomial,
+  validate_data$Condition,
+  positive = "CondB"
+)
+
+cm_sigmoid <- confusionMatrix(
+  pred_sigmoid,
+  validate_data$Condition,
+  positive = "CondB"
+)
+
+
+## Compare validation accuracy
+
+svm_kernel_accuracy <- data.frame(
+  Kernel = c("Radial", "Linear", "Polynomial", "Sigmoid"),
+  Accuracy = c(
+    cm_radial$overall["Accuracy"],
+    cm_linear$overall["Accuracy"],
+    cm_polynomial$overall["Accuracy"],
+    cm_sigmoid$overall["Accuracy"]
+  )
+)
+
+svm_kernel_accuracy
+```
+
+## Step 8: Supervised Learning (Logistic regression) 
+
+### Step 8.1: Train the Logistic Regression Classifier
+
+```{r}
+log_model <- glm(
+  Condition ~ .,
+  data = train_data,
+  family = "binomial"
+)
+
+##examine
+summary(log_model)
+```
+
+### Step 8.2: Predict the Validation Samples
+
+```{r}
+## Predict the probability of each valildation sample belonging to CondB
+log_prob <- predict(
+  log_model,
+  newdata = validate_data,
+  type = "response"
+)
+
+## View predicted probabilities
+log_prob
+
+## Convert probabilities into class predictions
+
+log_pred <- ifelse(
+  log_prob >= 0.5,
+  "CondB",
+  "CondA"
+)
+
+## Convert to a factor
+log_pred <- factor(
+  log_pred,
+  levels = c("CondA", "CondB")
+)
+
+log_pred
+```
+
+### Step 8.3: Logistic Regression Confusion Matrix
+
+```{r}
+##Compare with known experimental conditions
+log_cm <- confusionMatrix(
+  data = log_pred,
+  reference = validate_data$Condition,
+  positive = "CondB"
+)
+
+log_cm
+```
+
+## Step 9: Cross-Validation and Classifier Comparison
+
+### Step 9.1: Create Cross-Validation Folds
+
+```{r}
+set.seed(748)
+
+folds <- createFolds(
+  ML_data$Condition,
+  k = 7,
+  list = TRUE,
+  returnTrain = FALSE
+)
+
+## Examine the number of samples in each
+sapply(folds, length)
+```
+
+### Step 9.2: LDA 7-Fold Cross-Validation
+
+```{r}
+## Create an empty vector - stores LDA predictions
+lda_cv_pred <- rep(NA, nrow(ML_data))
+
+## Perform 7-fold cross-validation
+for (i in 1:length(folds)) {
+
+  test_index <- folds[[i]]
+
+  train_cv <- ML_data[-test_index, ]
+  test_cv <- ML_data[test_index, ]
+  
+  lda_cv_model <- lda(
+    Condition ~ .,
+    data = train_cv
+  )
+  
+  lda_cv_pred[test_index] <- as.character(
+    predict(
+      lda_cv_model,
+      newdata = test_cv
+    )$class
+  )
+}
+
+## Convert predictions to a factor
+lda_cv_pred <- factor(
+  lda_cv_pred,
+  levels = c("CondA", "CondB")
+)
+
+## Calculate cross-validation performance
+lda_cv_cm <- confusionMatrix(
+  data = lda_cv_pred,
+  reference = ML_data$Condition,
+  positive = "CondB"
+)
+
+lda_cv_cm
+```
+
+### Step 9.3: SVM 7-fold Cross-Validation
+
+```{r}
+## Create an empty vector - stores SVM predictions
+svm_cv_pred <- rep(NA, nrow(ML_data))
+
+## Perform 7-fold cross-validation
+for (i in 1:length(folds)) {
+  
+  test_index <- folds[[i]]
+  
+  train_cv <- ML_data[-test_index, ]
+  test_cv <- ML_data[test_index, ]
+  
+  svm_cv_model <- svm(
+    Condition ~ .,
+    data = train_cv,
+    kernel = "radial"
+  )
+  
+  svm_cv_pred[test_index] <- as.character(
+    predict(
+      svm_cv_model,
+      newdata = test_cv
+    )
+  )
+}
+
+## Convert predictions to a factor
+svm_cv_pred <- factor(
+  svm_cv_pred,
+  levels = c("CondA", "CondB")
+)
+
+## Calculate cross-validation performance
+svm_cv_cm <- confusionMatrix(
+  data = svm_cv_pred,
+  reference = ML_data$Condition,
+  positive = "CondB"
+)
+
+svm_cv_cm
+```
+
+### Step 9.4: Logistic regression 7-fold Cross-Validation
+
+```{r}
+## Create an empty vector - stores logistic regression predictions
+log_cv_pred <- rep(NA, nrow(ML_data))
+
+## Perform 7-fold cross-validation
+for (i in 1:length(folds)) {
+  
+  test_index <- folds[[i]]
+  
+  train_cv <- ML_data[-test_index, ]
+  test_cv <- ML_data[test_index, ]
+  
+  log_cv_model <- glm(
+    Condition ~ .,
+    data = train_cv,
+    family = "binomial"
+  )
+  
+  log_cv_prob <- predict(
+    log_cv_model,
+    newdata = test_cv,
+    type = "response"
+  )
+  
+  log_cv_pred[test_index] <- ifelse(
+    log_cv_prob >= 0.5,
+    "CondB",
+    "CondA"
+  )
+}
+
+## Convert predictions to a factor
+log_cv_pred <- factor(
+  log_cv_pred,
+  levels = c("CondA", "CondB")
+)
+
+## Calculate cross-validation performance
+log_cv_cm <- confusionMatrix(
+  data = log_cv_pred,
+  reference = ML_data$Condition,
+  positive = "CondB"
+)
+
+log_cv_cm
+
+```
+
+### Step 9.5: Comparison of Cross-Validation Classifier Performance
+
+```{r}
+## Summarise 7-fold cross-validation performance
+
+cv_performance <- data.frame(
+  Model = c(
+    "Logistic Regression",
+    "LDA",
+    "SVM (Radial)"
+  ),
+  
+  Accuracy = c(
+    unname(log_cv_cm$overall["Accuracy"]),
+    unname(lda_cv_cm$overall["Accuracy"]),
+    unname(svm_cv_cm$overall["Accuracy"])
+  ),
+  
+  Sensitivity = c(
+    unname(log_cv_cm$byClass["Sensitivity"]),
+    unname(lda_cv_cm$byClass["Sensitivity"]),
+    unname(svm_cv_cm$byClass["Sensitivity"])
+  ),
+  
+  Specificity = c(
+    unname(log_cv_cm$byClass["Specificity"]),
+    unname(lda_cv_cm$byClass["Specificity"]),
+    unname(svm_cv_cm$byClass["Specificity"])
+  ),
+  
+  Balanced_Accuracy = c(
+    unname(log_cv_cm$byClass["Balanced Accuracy"]),
+    unname(lda_cv_cm$byClass["Balanced Accuracy"]),
+    unname(svm_cv_cm$byClass["Balanced Accuracy"])
+  )
+)
+
+cv_performance
+
+```
+
+### Step 9.6: Cross-Validation of SVM Kernel Function
+
+Since our earlier single split had radial, polynomial and sigmoid tied. It would be useful to see whether that tie survives 7-fold CV?
+
+```{r}
+kernels <- c("radial", "linear", "polynomial", "sigmoid")
+
+## Create an empty dataframe - stores results
+svm_kernel_cv <- data.frame()
+
+for (kernel_name in kernels) {
+  
+  kernel_pred <- rep(NA, nrow(ML_data))
+  
+  for (i in 1:length(folds)) {
+    
+    test_index <- folds[[i]]
+    
+    train_cv <- ML_data[-test_index, ]
+    test_cv <- ML_data[test_index, ]
+    
+    kernel_model <- svm(
+      Condition ~ .,
+      data = train_cv,
+      kernel = kernel_name
+    )
+    
+    kernel_pred[test_index] <- as.character(
+      predict(
+        kernel_model,
+        newdata = test_cv
+      )
+    )
+  }
+  
+  kernel_pred <- factor(
+    kernel_pred,
+    levels = c("CondA", "CondB")
+  )
+  
+  kernel_cm <- confusionMatrix(
+    data = kernel_pred,
+    reference = ML_data$Condition,
+    positive = "CondB"
+  )
+
+  svm_kernel_cv <- rbind(
+    svm_kernel_cv,
+    data.frame(
+      Kernel = kernel_name,
+      Accuracy = unname(kernel_cm$overall["Accuracy"]),
+      Sensitivity = unname(kernel_cm$byClass["Sensitivity"]),
+      Specificity = unname(kernel_cm$byClass["Specificity"]),
+      Balanced_Accuracy =
+        unname(kernel_cm$byClass["Balanced Accuracy"])
+    )
+  )
+}
+
+
+svm_kernel_cv
+```
+
+## Step 10: Results:
+
+Logistic regression: **54% CV accuracy**
+
+LDA: **74% CV accuracy**
+
+Radial SVM: **84% CV accuracy**
+
+Best SVM configuration — sigmoid: **88% CV accuracy**
+
+### Step 10.1: Visualisation of results
+
+```{r}
+## Build classifier performance table from saved results
+
+classifier_plot_data <- data.frame(
+  Model = c(
+    "Logistic Regression",
+    "LDA",
+    "SVM (Sigmoid)"
+  ),
+
+  Accuracy = c(
+    unname(log_cv_cm$overall["Accuracy"]),
+    unname(lda_cv_cm$overall["Accuracy"]),
+    svm_kernel_cv$Accuracy[svm_kernel_cv$Kernel == "sigmoid"]
+  ),
+
+  Sensitivity = c(
+    unname(log_cv_cm$byClass["Sensitivity"]),
+    unname(lda_cv_cm$byClass["Sensitivity"]),
+    svm_kernel_cv$Sensitivity[svm_kernel_cv$Kernel == "sigmoid"]
+  ),
+
+  Specificity = c(
+    unname(log_cv_cm$byClass["Specificity"]),
+    unname(lda_cv_cm$byClass["Specificity"]),
+    svm_kernel_cv$Specificity[svm_kernel_cv$Kernel == "sigmoid"]
+  )
+)
+
+classifier_plot_data
+
+
+##Reshape
+classifier_long <- reshape2::melt(
+  classifier_plot_data,
+  id.vars = "Model",
+  variable.name = "Metric",
+  value.name = "Performance"
+)
+
+
+## Plot
+#| fig-width: 9
+#| fig-height: 6
+#| out-width: "100%"
+
+ggplot(
+  classifier_long,
+  aes(
+    x = Model,
+    y = Performance,
+    fill = Metric
+  )
+) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width = 0.7
+  ) +
+
+  geom_text(
+    aes(
+      label = paste0(
+        round(Performance * 100),
+        "%"
+      )
+    ),
+    position = position_dodge(width = 0.8),
+    vjust = -0.4,
+    size = 3.5
+  ) +
+
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.2),
+    labels = scales::percent_format()
+  ) +
+
+  labs(
+    title = "Seven-fold cross-validated classifier performance",
+    x = NULL,
+    y = "Performance",
+    fill = "Metric"
+  ) +
+
+  theme_classic(base_size = 12) +
+
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      hjust = 0.5
+    ),
+
+    axis.text.x = element_text(
+      angle = 20,
+      hjust = 1
+    ),
+
+    legend.position = "top"
+  )
+```
+Packages used:
+```{r}
+sessionInfo()
+```
